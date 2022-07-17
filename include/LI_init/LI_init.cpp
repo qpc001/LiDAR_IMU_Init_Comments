@@ -78,9 +78,16 @@ void LI_Init::push_Lidar_CalibState(const M3D &rot, const V3D &omg, const V3D &l
     Lidar_state_group.push_back(Lidarstate);
 }
 
-
+/**
+ * @breif
+ * 1. 首先去除 数据采集时刻前 3 秒的imu和lo数据
+ * 2. imu数据均值滤波
+ * 3. 由于IMU频率通常高于LiDAR odometer的频率，为了拿到lo和imu同步的数据，对imu进行插值得到lo时刻下的imu数据
+ * @param move_start_time
+ */
 void LI_Init::downsample_interpolate_IMU(const double &move_start_time) {
 
+    // 去除 数据采集时刻前 3 秒的imu和lo数据
     while (IMU_state_group_ALL.front().timeStamp < move_start_time - 3.0)
         IMU_state_group_ALL.pop_front();
     while (Lidar_state_group.front().timeStamp < move_start_time - 3.0)
@@ -92,6 +99,7 @@ void LI_Init::downsample_interpolate_IMU(const double &move_start_time) {
     IMU_states_all_origin.assign(IMU_state_group_ALL.begin(), IMU_state_group_ALL.end() - 1);
 
     //Mean filter to attenuate noise
+    //对imu加速度做一个局部的均值平滑
     int mean_filt_size = 2;
     for (int i = mean_filt_size; i < IMU_state_group_ALL.size() - mean_filt_size; i++) {
         V3D acc_real = Zero3d;
@@ -103,10 +111,16 @@ void LI_Init::downsample_interpolate_IMU(const double &move_start_time) {
 
 
     //Down-sample and interpolation，Fig.4 in the paper
-    for (int i = 0; i < Lidar_state_group.size(); i++) {
+    //由于IMU频率通常高于LiDAR odometer的频率，为了拿到lo和imu同步的数据，对imu进行插值得到lo时刻下的imu数据
+    for (int i = 0; i < Lidar_state_group.size(); i++) {    // 遍历每个lo数据
+        // 遍历imu数据，为了可以插值，从第1个imu数据开始遍历
         for (int j = 1; j < IMU_state_group_ALL.size(); j++) {
+            // 找到满足条件的imu数据：
+            // 前一帧时间 <= lo时间
+            // 当前帧imu时间 > lo时间
             if (IMU_state_group_ALL[j - 1].timeStamp <= Lidar_state_group[i].timeStamp
                 && IMU_state_group_ALL[j].timeStamp > Lidar_state_group[i].timeStamp) {
+                // 插值角速度、线加速度
                 CalibState IMU_state_interpolation;
                 double delta_t = IMU_state_group_ALL[j].timeStamp - IMU_state_group_ALL[j - 1].timeStamp;
                 double delta_t_right = IMU_state_group_ALL[j].timeStamp - Lidar_state_group[i].timeStamp;
@@ -115,6 +129,7 @@ void LI_Init::downsample_interpolate_IMU(const double &move_start_time) {
                                                   (1 - s) * IMU_state_group_ALL[j].ang_vel;
                 IMU_state_interpolation.linear_acc = s * IMU_state_group_ALL[j - 1].linear_acc +
                                                      (1 - s) * IMU_state_group_ALL[j].linear_acc;
+                // 将插值后的imu数据保存到IMU_state_group
                 push_IMU_CalibState(IMU_state_interpolation.ang_vel, IMU_state_interpolation.linear_acc,
                                     Lidar_state_group[i].timeStamp);
                 break;
@@ -124,6 +139,12 @@ void LI_Init::downsample_interpolate_IMU(const double &move_start_time) {
 
 }
 
+/**
+ * @brief
+ * 1. 计算imu角加速度
+ * 2. 计算lo角加速度
+ * 3. 计算lo线加速度
+ */
 void LI_Init::central_diff() {
     auto it_IMU_state = IMU_state_group.begin() + 1;
     for (; it_IMU_state != IMU_state_group.end() - 2; it_IMU_state++) {
@@ -160,6 +181,7 @@ void LI_Init::central_diff() {
 void LI_Init::xcorr_temporal_init(const double &odom_freq) {
     int N = IMU_state_group.size();
     //Calculate mean value of IMU and LiDAR angular velocity
+    // 计算两个数据队列的角速度均值
     double mean_IMU_ang_vel = 0, mean_LiDAR_ang_vel = 0;
     for (int i = 0; i < N; i++) {
         mean_IMU_ang_vel += (IMU_state_group[i].ang_vel.norm() - mean_IMU_ang_vel) / (i + 1);
@@ -167,10 +189,13 @@ void LI_Init::xcorr_temporal_init(const double &odom_freq) {
     }
 
     //Calculate zero-centered cross correlation
+    // 计算去质心后的相关度
     double max_corr = -DBL_MAX;
+    // 偏移量从 -N+1 到 N-1
     for (int lag = -N + 1; lag < N; lag++) {
         double corr = 0;
-        int cnt = 0;
+        int cnt = 0;    // 这个cnt没用
+        // 给定偏移lag，计算一次相关度
         for (int i = 0; i < N; i++) {
             int j = i + lag;
             if (j < 0 || j > N - 1)
@@ -181,13 +206,16 @@ void LI_Init::xcorr_temporal_init(const double &odom_freq) {
                         (Lidar_state_group[j].ang_vel.norm() - mean_LiDAR_ang_vel);  // Zero-centered cross correlation
             }
         }
-
+        // 保存相关度最大的对应偏移量
         if (corr > max_corr) {
             max_corr = corr;
             lag_IMU_wtr_Lidar = -lag;
         }
     }
 
+    // lag_IMU_wtr_Lidar： 这里算出来的是lo时间间隔单位的时间，即偏移量是多少个lo间隔
+    // 下面换算成秒，保存到time_lag_1
+    // odom_freq：一秒有多少个lo数据
     time_lag_1 = lag_IMU_wtr_Lidar / odom_freq;
     cout << "Max Cross-correlation: IMU lag wtr Lidar : " << -lag_IMU_wtr_Lidar << endl;
 }
@@ -237,6 +265,11 @@ void LI_Init::cut_sequence_tail() {
         Lidar_state_group.pop_back();
 }
 
+/**
+ * @brief imu数据
+ * 由于前一步求出了imu和lo数据的时间偏移，
+ * 这里进一步微调，插值得到lo时刻下的imu加速度
+ */
 void LI_Init::acc_interpolate() {
     //Interpolation to get acc_I(t_L)
     for (int i = 1; i < Lidar_state_group.size() - 1; i++) {
@@ -382,17 +415,20 @@ void LI_Init::solve_Rot_bias_gyro(double &timediff_imu_wrt_lidar) {
 
 
 
+    // 更新参数
     Eigen::Quaterniond q_LI(R_LI_quat[0], R_LI_quat[1], R_LI_quat[2], R_LI_quat[3]);
     Rot_Lidar_wrt_IMU = q_LI.matrix();
     V3D euler_angle = RotMtoEuler(q_LI.matrix());
     gyro_bias = V3D(bias_g[0], bias_g[1], bias_g[2]);
 
+    // 更新时间偏移
     time_lag_2 = time_lag2;
     time_delay_IMU_wtr_Lidar = time_lag_1 + time_lag_2;
     cout << "Total time delay (IMU wtr Lidar): " << time_delay_IMU_wtr_Lidar + timediff_imu_wrt_lidar << " s" << endl;
     cout << "Using LIO: SUBTRACT this value from IMU timestamp" << endl
          << "           or ADD this value to LiDAR timestamp." << endl <<endl;
 
+    // 第二次时间补偿
     //The second temporal compensation
     IMU_time_compensate(get_lag_time_2(), false);
 
@@ -506,17 +542,31 @@ void LI_Init::normalize_acc(deque<CalibState> &signal_in) {
     }
 }
 
+/**
+ * @brief 分析采集的数据是否足够用于初始化lidar-imu
+ * TODO：待看
+ * @param Jacobian_rot[out]
+ * @param frame_num[in] 将点云切开后的总帧数
+ * @param lidar_omg[in] 当前LO给出的角速度
+ * @param orig_odom_freq[in] 原始激光的帧率
+ * @param cut_frame_num[in] 每一帧雷达切开多少份
+ * @return
+ */
 bool LI_Init::data_sufficiency_assess(MatrixXd &Jacobian_rot, int &frame_num, V3D &lidar_omg, int &orig_odom_freq,
                                       int &cut_frame_num) {
     //Calculation of Rotation Jacobian
+    // 角速度的反对称矩阵
     M3D lidar_omg_skew;
     lidar_omg_skew << SKEW_SYM_MATRX(lidar_omg);
+    // 将上面的反对称矩阵填入到Jacobian_rot对应的位置
     Jacobian_rot.block<3, 3>(3 * frame_num, 0) = lidar_omg_skew;
     bool data_sufficient = false;
 
     //Give a Data Appraisal every second
+    // 每一秒进入一次
     if (frame_num % orig_odom_freq * cut_frame_num == 0) {
         M3D Hessian_rot = Jacobian_rot.transpose() * Jacobian_rot;
+        // 对旋转的J^TJ进行特征值分解
         EigenSolver<M3D> es(Hessian_rot);
         V3D EigenValue = es.eigenvalues().real();
         M3D EigenVec_mat = es.eigenvectors().real();
@@ -586,34 +636,54 @@ void LI_Init::clear() {
     cout << "\x1B[2J\x1B[H";
 }
 
+/**
+ * @breif 初始化lidar-imu
+ * @param orig_odom_freq[in] 激光原始数据帧率
+ * @param cut_frame_num[in] 激光被切成几份
+ * @param timediff_imu_wrt_lidar[out] imu时间在lidar时间轴上的偏移
+ * @param move_start_time[in] 开始采集数据的时刻
+ */
 void LI_Init::LI_Initialization(int &orig_odom_freq, int &cut_frame_num, double &timediff_imu_wrt_lidar,
                                 const double &move_start_time) {
 
     TimeConsuming time("Batch optimization");
 
+    // imu数据插值，得到与lo同一时刻的imu数据
     downsample_interpolate_IMU(move_start_time);
+    // 保存滤波之前的数据
     fout_before_filter();
+    // 不知道干啥的
     IMU_time_compensate(0.0, true);
 
 
     deque<CalibState> IMU_after_zero_phase;
     deque<CalibState> Lidar_after_zero_phase;
+    // 零相位（无延迟）巴特沃斯低通滤波器
     zero_phase_filt(get_IMU_state(), IMU_after_zero_phase);
+    // 取imu前10个值（默认认为是静止状态下的）计算加速度幅值，然后对所有imu数据scale到宏定义的大小G_m_s2 (9.81)
     normalize_acc(IMU_after_zero_phase);
+    // 零相位（无延迟）巴特沃斯低通滤波器
     zero_phase_filt(get_Lidar_state(), Lidar_after_zero_phase);
+    // 将处理完的数据保存回IMU_state_group、Lidar_state_group
     set_IMU_state(IMU_after_zero_phase);
     set_Lidar_state(Lidar_after_zero_phase);
+    // 弹出两条数据队列最后20个值，然后再同步一下
     cut_sequence_tail();
 
 
-
+    // 互相关法计算imu相对lidar的时间偏移time_lag_1，粒度为lo的间隔
     xcorr_temporal_init(orig_odom_freq * cut_frame_num);
+    // 使用上面计算的时间偏移time_lag_1，对imu数据进行补偿
     IMU_time_compensate(get_lag_time_1(), false);
 
 
+    // * 1. 计算imu角加速度
+    // * 2. 计算lo角加速度
+    // * 3. 计算lo线加速度
     central_diff();
 
 
+    // 再次进行巴特沃斯低通滤波（imu角加速度、lo角加速度、lo线加速度）
     deque<CalibState> IMU_after_2nd_zero_phase;
     deque<CalibState> Lidar_after_2nd_zero_phase;
     zero_phase_filt(get_IMU_state(), IMU_after_2nd_zero_phase);
@@ -621,12 +691,17 @@ void LI_Init::LI_Initialization(int &orig_odom_freq, int &cut_frame_num, double 
     set_states_2nd_filter(IMU_after_2nd_zero_phase, Lidar_after_2nd_zero_phase);
 
 
+    // 角速度约束求旋转初值
     solve_Rotation_only();
 
+    // 进一步优化求旋转、bias_g、时间偏移
     solve_Rot_bias_gyro(timediff_imu_wrt_lidar);
 
+    // 由于前一步求出了imu和lo数据的时间偏移，
+    // 这里进一步微调，插值得到lo时刻下的imu加速度
     acc_interpolate();
 
+    // 最后优化平移外参、bias_a、重力向量与第一帧激光坐标系的旋转
     solve_trans_biasacc_grav();
 
     printf(BOLDBLUE"============================================================ \n\n" RESET);

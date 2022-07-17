@@ -468,10 +468,12 @@ bool sync_packages(MeasureGroup &meas) {
         lidar_pushed = true;
     }
 
+    // 最新的imu数据时间 < lidar数据时间，直接return， 等待IMU数据到达，同时保留当前这一帧雷达
     if (last_timestamp_imu < lidar_end_time)
         return false;
 
     /** push imu data, and pop from imu buffer **/
+    // 将所有时间  < lidar数据时间的imu数据保存到meas.imu[]
     double imu_time = imu_buffer.front()->header.stamp.toSec();
     meas.imu.clear();
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time)) {
@@ -919,6 +921,9 @@ int main(int argc, char **argv) {
             svd_time = 0;
             t0 = omp_get_wtime();
 
+            /// IMU process, kf prediction, undistortion
+            // IMU数据初始化，初始化完成后进入去畸变函数
+            // 去畸变函数中，利用IMU数据对state状态进行前向传播，同时对点云进行去畸变，得到feats_undistort
             p_imu->Process(Measures, state, feats_undistort);
             state_propagat = state;
 
@@ -1091,6 +1096,8 @@ int main(int argc, char **argv) {
                         Hsub.row(i) << VEC_FROM_ARRAY(A), norm_p.x, norm_p.y, norm_p.z, 0, 0, 0, 0, 0, 0;
                     }
 
+                    // 这里* 1000;是为了提高激光观测的权重，体现在后面 K_1 = (H_T_H + state.cov.inverse()).inverse(); 这里
+                    // 而残差不用* 1000是因为 H的1000会被约掉
                     Hsub_T_R_inv.col(i) = Hsub.row(i).transpose() * 1000;
                     /*** Measurement: distance to the closest surface/corner ***/
                     meas_vec(i) = -norm_p.intensity;
@@ -1178,6 +1185,8 @@ int main(int argc, char **argv) {
             kdtree_size_end = ikdtree.size();
 
             /***** Device starts to move, data accmulation begins. ****/
+            // 如果imu还没初始化完成（!imu_en）
+            // 并且还没开始收集数据，则开始收集数据
             if (!imu_en && !data_accum_start && state.pos_end.norm() > 0.05) {
                 printf(BOLDCYAN "[Initialization] Movement detected, data accumulation starts.\n\n\n\n\n" RESET);
                 data_accum_start = true;
@@ -1222,26 +1231,41 @@ int main(int argc, char **argv) {
                 }
             }
 
-
+            // 如果imu还没初始化完成（!imu_en）
+            // 并且数据还没采集够，则继续保存数据到Init_LI
             if (!imu_en && !data_accum_finished && data_accum_start) {
                 //Push Lidar's Angular velocity and linear velocity
+                // imu还没有初始化完成的阶段，采用恒速运动模型，此时state.bias_g表示角速度（LO得到的结果）
                 Init_LI->push_Lidar_CalibState(state.rot_end, state.bias_g, state.vel_end, lidar_end_time);
                 //Data Accumulation Sufficience Appraisal
+                // 检查数据是否足够
                 data_accum_finished = Init_LI->data_sufficiency_assess(Jaco_rot, frame_num, state.bias_g,
                                                                        orig_odom_freq, cut_frame_num);
 
+                // 如果数据足够，则开始初始化
                 if (data_accum_finished) {
                     Init_LI->LI_Initialization(orig_odom_freq, cut_frame_num, timediff_imu_wrt_lidar, move_start_time);
 
                     online_calib_starts_time = lidar_end_time;
 
+                    // 初始化完成，更新状态，进入refinement阶段
+                    // 注意：下面将状态从lidar表示转换到imu表示，但是参考坐标系不变，还是以刚开始时第0帧激光作为参考坐标系
+                    // 设置标志位imu_en = true;
                     //Transfer to FAST-LIO2
                     imu_en = true;
+                    // 激光到IMU的变换（将点从激光坐标系转换到IMU坐标系）
                     state.offset_R_L_I = Init_LI->get_R_LI();
                     state.offset_T_L_I = Init_LI->get_T_LI();
+                    // 右侧的state.pos_end;表示当前激光雷达在第0帧激光坐标系的坐标
+                    // 左侧的state.pos_end = 表示当前imu在第0帧激光坐标系的坐标
+                    // state.offset_T_L_I：激光在IMU坐标系的坐标
+                    // imu世界坐标 = Ri->w * pi   +  t_i->w
+                    //            = t_i->w = Rl->w til(imu在激光坐标系的坐标) + tl->w
+                    //                     = Rl->w (-R_L_I^T * T_L_I) + tl->w
                     state.pos_end = -state.rot_end * state.offset_R_L_I.transpose() * state.offset_T_L_I +
                                     state.pos_end; //Body frame is IMU frame in FAST-LIO mode
                     state.rot_end = state.rot_end * state.offset_R_L_I.transpose();
+                    // 重力向量在第0帧激光坐标系的表示
                     state.gravity = Init_LI->get_Grav_L0();
                     state.bias_g = Init_LI->get_gyro_bias();
                     state.bias_a = Init_LI->get_acc_bias();
